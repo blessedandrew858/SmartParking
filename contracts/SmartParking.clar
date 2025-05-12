@@ -351,3 +351,118 @@
     (map-get? emergency-requests request-id)
 )
 
+
+(define-constant ERR-NOT-VALET (err u109))
+(define-constant ERR-NO-VALET-REQUEST (err u110))
+(define-constant VALET-FEE u25)
+
+(define-map certified-valets principal bool)
+
+(define-map valet-requests uint 
+    {
+        user: principal,
+        valet: (optional principal),
+        spot-id: uint,
+        status: (string-ascii 10),
+        requested-at: uint
+    }
+)
+
+(define-data-var valet-request-counter uint u0)
+
+(define-public (register-valet (valet-address principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (ok (map-set certified-valets valet-address true))
+    )
+)
+
+(define-public (request-valet-service (spot-id uint))
+    (let (
+        (request-id (var-get valet-request-counter))
+    )
+        (try! (stx-transfer? VALET-FEE tx-sender CONTRACT-OWNER))
+        
+        (map-set valet-requests request-id {
+            user: tx-sender,
+            valet: none,
+            spot-id: spot-id,
+            status: "pending",
+            requested-at: stacks-block-height
+        })
+        
+        (var-set valet-request-counter (+ request-id u1))
+        (ok request-id)
+    )
+)
+
+(define-public (accept-valet-request (request-id uint))
+    (let (
+        (request (unwrap! (map-get? valet-requests request-id) ERR-NO-VALET-REQUEST))
+    )
+        (asserts! (default-to false (map-get? certified-valets tx-sender)) ERR-NOT-VALET)
+        
+        (ok (map-set valet-requests request-id {
+            user: (get user request),
+            valet: (some tx-sender),
+            spot-id: (get spot-id request),
+            status: "accepted",
+            requested-at: (get requested-at request)
+        }))
+    )
+)
+
+
+(define-public (complete-valet-service (request-id uint))
+    (let (
+        (request (unwrap! (map-get? valet-requests request-id) ERR-NO-VALET-REQUEST))
+    )
+        (asserts! (is-eq tx-sender (unwrap! (get valet request) ERR-NOT-VALET)) ERR-NOT-AUTHORIZED)
+        
+        (map-set valet-requests request-id {
+            user: (get user request),
+            valet: none,
+            spot-id: (get spot-id request),
+            status: "completed",
+            requested-at: (get requested-at request)
+        })
+        
+        (ok true)
+    )
+)
+
+
+(define-constant BASE-SURGE-MULTIPLIER u100)
+(define-constant MAX-SURGE-MULTIPLIER u300)
+(define-constant OCCUPANCY-THRESHOLD u80)
+(define-constant TOTAL-SPOTS u100)
+
+;; Helper function to get minimum of two numbers
+(define-private (get-min (a uint) (b uint))
+    (if (<= a b) a b))
+
+(define-data-var current-surge-multiplier uint u100)
+(define-data-var occupied-spots uint u0)
+
+(define-public (update-surge-pricing)
+    (let (
+        (occupancy-rate (/ (* (var-get occupied-spots) u100) TOTAL-SPOTS))
+        (new-multiplier (if (>= occupancy-rate OCCUPANCY-THRESHOLD)
+            (get-min MAX-SURGE-MULTIPLIER (* BASE-SURGE-MULTIPLIER u2))
+            BASE-SURGE-MULTIPLIER
+        ))
+    )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set current-surge-multiplier new-multiplier)
+        (ok new-multiplier)
+    )
+)
+
+(define-read-only (get-current-price (spot-id uint))
+    (let (
+        (spot (unwrap! (map-get? parking-spots spot-id) ERR-INVALID-PARKING-SPOT))
+        (base-rate (if (get is-premium spot) (* HOURLY-RATE PREMIUM-MULTIPLIER) HOURLY-RATE))
+    )
+        (ok (/ (* base-rate (var-get current-surge-multiplier)) u100))
+    )
+)
