@@ -15,7 +15,53 @@
 (define-data-var total-spots uint u100)
 (define-data-var total-revenue uint u0)
 
-;; Data Maps
+
+(define-constant ERR-VIOLATION-NOT-FOUND (err u111))
+(define-constant ERR-FINE-ALREADY-PAID (err u112))
+(define-constant ERR-DISPUTE-PERIOD-EXPIRED (err u113))
+(define-constant ERR-INVALID-DISPUTE (err u114))
+
+(define-constant OVERSTAY-FINE u30)
+(define-constant UNAUTHORIZED-PARKING-FINE u50)
+(define-constant EMERGENCY-ZONE-FINE u100)
+(define-constant DISPUTE-PERIOD u144)
+
+(define-data-var violation-counter uint u0)
+(define-data-var total-fines-collected uint u0)
+
+(define-map parking-violations uint 
+    {
+        violator: principal,
+        spot-id: uint,
+        violation-type: (string-ascii 20),
+        fine-amount: uint,
+        issued-at: uint,
+        paid: bool,
+        disputed: bool,
+        dispute-resolved: bool
+    }
+)
+
+(define-map emergency-zones uint bool)
+
+(define-map violation-disputes uint 
+    {
+        violation-id: uint,
+        dispute-reason: (string-ascii 100),
+        submitted-at: uint,
+        reviewed: bool,
+        upheld: bool
+    }
+)
+
+(define-map user-violation-history principal 
+    {
+        total-violations: uint,
+        total-fines-paid: uint,
+        repeat-offender: bool
+    }
+)
+
 (define-map parking-spots uint 
     {
         is-premium: bool,
@@ -464,5 +510,200 @@
         (base-rate (if (get is-premium spot) (* HOURLY-RATE PREMIUM-MULTIPLIER) HOURLY-RATE))
     )
         (ok (/ (* base-rate (var-get current-surge-multiplier)) u100))
+    )
+)
+
+
+(define-public (designate-emergency-zone (spot-id uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (ok (map-set emergency-zones spot-id true))
+    )
+)
+
+(define-public (issue-violation (violator principal) (spot-id uint) (violation-type (string-ascii 20)))
+    (let (
+        (violation-id (var-get violation-counter))
+        (fine-amount (get-fine-amount violation-type spot-id))
+        (user-history (default-to {total-violations: u0, total-fines-paid: u0, repeat-offender: false} 
+                                 (map-get? user-violation-history violator)))
+        (is-repeat (>= (get total-violations user-history) u3))
+        (final-fine (if is-repeat (* fine-amount u2) fine-amount))
+    )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        
+        (map-set parking-violations violation-id {
+            violator: violator,
+            spot-id: spot-id,
+            violation-type: violation-type,
+            fine-amount: final-fine,
+            issued-at: stacks-block-height,
+            paid: false,
+            disputed: false,
+            dispute-resolved: false
+        })
+        
+        (map-set user-violation-history violator {
+            total-violations: (+ (get total-violations user-history) u1),
+            total-fines-paid: (get total-fines-paid user-history),
+            repeat-offender: is-repeat
+        })
+        
+        (var-set violation-counter (+ violation-id u1))
+        (ok violation-id)
+    )
+)
+
+(define-public (pay-fine (violation-id uint))
+    (let (
+        (violation (unwrap! (map-get? parking-violations violation-id) ERR-VIOLATION-NOT-FOUND))
+        (user-history (default-to {total-violations: u0, total-fines-paid: u0, repeat-offender: false} 
+                                 (map-get? user-violation-history tx-sender)))
+    )
+        (asserts! (is-eq tx-sender (get violator violation)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get paid violation)) ERR-FINE-ALREADY-PAID)
+        
+        (try! (stx-transfer? (get fine-amount violation) tx-sender CONTRACT-OWNER))
+        
+        (map-set parking-violations violation-id {
+            violator: (get violator violation),
+            spot-id: (get spot-id violation),
+            violation-type: (get violation-type violation),
+            fine-amount: (get fine-amount violation),
+            issued-at: (get issued-at violation),
+            paid: true,
+            disputed: (get disputed violation),
+            dispute-resolved: (get dispute-resolved violation)
+        })
+        
+        (map-set user-violation-history tx-sender {
+            total-violations: (get total-violations user-history),
+            total-fines-paid: (+ (get total-fines-paid user-history) (get fine-amount violation)),
+            repeat-offender: (get repeat-offender user-history)
+        })
+        
+        (var-set total-fines-collected (+ (var-get total-fines-collected) (get fine-amount violation)))
+        (ok true)
+    )
+)
+
+(define-public (dispute-violation (violation-id uint) (reason (string-ascii 100)))
+    (let (
+        (violation (unwrap! (map-get? parking-violations violation-id) ERR-VIOLATION-NOT-FOUND))
+        (current-block stacks-block-height)
+        (dispute-deadline (+ (get issued-at violation) DISPUTE-PERIOD))
+    )
+        (asserts! (is-eq tx-sender (get violator violation)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= current-block dispute-deadline) ERR-DISPUTE-PERIOD-EXPIRED)
+        (asserts! (not (get disputed violation)) ERR-INVALID-DISPUTE)
+        (asserts! (not (get paid violation)) ERR-FINE-ALREADY-PAID)
+        
+        (map-set parking-violations violation-id {
+            violator: (get violator violation),
+            spot-id: (get spot-id violation),
+            violation-type: (get violation-type violation),
+            fine-amount: (get fine-amount violation),
+            issued-at: (get issued-at violation),
+            paid: false,
+            disputed: true,
+            dispute-resolved: false
+        })
+        
+        (map-set violation-disputes violation-id {
+            violation-id: violation-id,
+            dispute-reason: reason,
+            submitted-at: current-block,
+            reviewed: false,
+            upheld: false
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (violation-id uint) (uphold-violation bool))
+    (let (
+        (violation (unwrap! (map-get? parking-violations violation-id) ERR-VIOLATION-NOT-FOUND))
+        (dispute (unwrap! (map-get? violation-disputes violation-id) ERR-INVALID-DISPUTE))
+    )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (get disputed violation) ERR-INVALID-DISPUTE)
+        (asserts! (not (get reviewed dispute)) ERR-INVALID-DISPUTE)
+        
+        (map-set violation-disputes violation-id {
+            violation-id: violation-id,
+            dispute-reason: (get dispute-reason dispute),
+            submitted-at: (get submitted-at dispute),
+            reviewed: true,
+            upheld: uphold-violation
+        })
+        
+        (map-set parking-violations violation-id {
+            violator: (get violator violation),
+            spot-id: (get spot-id violation),
+            violation-type: (get violation-type violation),
+            fine-amount: (if uphold-violation (get fine-amount violation) u0),
+            issued-at: (get issued-at violation),
+            paid: (not uphold-violation),
+            disputed: true,
+            dispute-resolved: true
+        })
+        
+        (ok uphold-violation)
+    )
+)
+
+(define-public (check-overstay-violations)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (ok true)
+    )
+)
+
+;; Private Functions
+
+(define-private (get-fine-amount (violation-type (string-ascii 20)) (spot-id uint))
+    (if (is-eq violation-type "overstay")
+        OVERSTAY-FINE
+        (if (is-eq violation-type "unauthorized")
+            UNAUTHORIZED-PARKING-FINE
+            (if (is-eq violation-type "emergency-zone")
+                EMERGENCY-ZONE-FINE
+                u25
+            )
+        )
+    )
+)
+
+;; Read-only Functions
+
+(define-read-only (get-violation-details (violation-id uint))
+    (map-get? parking-violations violation-id)
+)
+
+(define-read-only (get-user-violations (user principal))
+    (map-get? user-violation-history user)
+)
+
+(define-read-only (get-dispute-details (violation-id uint))
+    (map-get? violation-disputes violation-id)
+)
+
+(define-read-only (is-emergency-zone (spot-id uint))
+    (default-to false (map-get? emergency-zones spot-id))
+)
+
+(define-read-only (get-total-fines-collected)
+    (var-get total-fines-collected)
+)
+
+(define-read-only (get-unpaid-violations (user principal))
+    (let (
+        (user-history (map-get? user-violation-history user))
+    )
+        (match user-history
+            history (some (get total-violations history))
+            none
+        )
     )
 )
